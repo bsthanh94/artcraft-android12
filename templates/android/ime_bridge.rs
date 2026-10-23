@@ -11,21 +11,14 @@
 // ARTCRAFT_ANDROID_IME_BRIDGE_V5_DIFF
 pub mod ime {
     use android_activity::AndroidApp;
-    use jni::{
-        JavaVM, jni_sig, jni_str,
-        objects::{JObject, JString},
-    };
+    use jni::{JavaVM, jni_sig, jni_str, objects::{JObject, JString}};
     use std::sync::Arc;
 
-    /// Emitted at startup so a device log (and the packaged `.so` strings) can confirm this shell —
-    /// including the soft-keyboard bridge — is the one running.
     pub const IME_MARKER: &str = "ARTCRAFT_ANDROID_IME_BRIDGE_V5_DIFF";
 
     pub struct ImeBridge {
         app: AndroidApp,
         vm: Arc<JavaVM>,
-        /// Set once the Activity reports it has no `imePoll` (an Activity that never adopted the IME
-        /// host view), so the per-frame poll stops paying for a call that can only fail.
         unsupported: bool,
         /// Toàn bộ text IME đang giữ (đồng bộ với EditText bên Java).
         ime_text: String,
@@ -46,27 +39,16 @@ pub mod ime {
             }
         }
 
-        /// Translate every keyboard event the Activity has queued since the last frame into the egui
-        /// IME events the focused `TextEdit` understands. Call once per frame from `raw_input_hook`.
-        pub fn poll(&mut self, raw: &mut egui::RawInput) {
-            if self.unsupported {
-                return;
-            }
-            loop {
-                match self.next_state() {
-                    Ok(Some(state)) => self.handle_text_state(&state, raw),
-                    Ok(None) => break,
-                    Err(error) => {
-                        log::warn!("Android soft-keyboard bridge unavailable: {error}");
-                        self.unsupported = true;
-                        break;
-                    }
-                }
-            }
+        /// Alias for `poll` — the newer generated launcher's `raw_input_hook` calls
+        /// `self.ime.interaction(raw)` instead of `self.ime.poll(raw)`. Both names
+        /// must exist so the build works against either template version.
+        pub fn interaction(&mut self, raw: &mut egui::RawInput) {
+            self.poll(raw);
         }
 
-        /// Hide the soft keyboard by calling the Activity's `imeHide`. Used when focus is
-        /// surrendered during scroll/draw so the keyboard doesn't persist.
+        /// Hide the soft keyboard by calling the Activity's `imeHide`. Present in
+        /// the V1 bridge; kept here because some generated launchers still call it
+        /// when focus is surrendered (scroll / draw).
         pub fn hide_ime(&self) -> Result<(), String> {
             self.vm
                 .attach_current_thread(|env| -> jni::errors::Result<()> {
@@ -88,18 +70,32 @@ pub mod ime {
                 .map_err(|error| error.to_string())
         }
 
+        /// Translate every queued text state since the last frame into egui IME
+        /// events the focused `TextEdit` understands. Call once per frame.
+        pub fn poll(&mut self, raw: &mut egui::RawInput) {
+            if self.unsupported {
+                return;
+            }
+            loop {
+                match self.next_state() {
+                    Ok(Some(state)) => self.handle_text_state(&state, raw),
+                    Ok(None) => break,
+                    Err(error) => {
+                        log::warn!("Android soft-keyboard bridge unavailable: {error}");
+                        self.unsupported = true;
+                        break;
+                    }
+                }
+            }
+        }
+
         fn next_state(&self) -> Result<Option<String>, String> {
             self.vm
                 .attach_current_thread(|env| -> jni::errors::Result<Option<String>> {
                     let activity_raw = self.app.activity_as_ptr() as jni::sys::jobject;
-                    // SAFETY: AndroidApp retains this global Activity reference; as_cast_raw borrows
-                    // it without taking ownership or attempting to delete the reference.
+                    // SAFETY: AndroidApp retains this global Activity reference; as_cast_raw
+                    // borrows it without taking ownership or attempting to delete the reference.
                     let activity = unsafe { env.as_cast_raw::<JObject>(&activity_raw)? };
-                    // An Activity that never adopted the IME host has no `imePoll`; invoking it raises
-                    // a pending `NoSuchMethodError`. jni deliberately leaves that exception for the
-                    // caller to handle, and this thread is shared with the SAF bridge, so clear it
-                    // before reporting the missing method (otherwise the next unrelated JNI call sees
-                    // a stale pending exception).
                     let value = match env.call_method(
                         &*activity,
                         jni_str!("imePoll"),
