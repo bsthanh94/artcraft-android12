@@ -452,6 +452,7 @@ public final class __CLASS__ extends GameActivity {
                             if (start > end) { int t = start; start = end; end = t; }
                             // Format: start|end|text (start/end are UTF-16 offsets)
                             imeTextStates.offer(start + "|" + end + "|" + text);
+                            wakeNativeLoopForIme();
                         }
 
                         @Override
@@ -549,6 +550,32 @@ public final class __CLASS__ extends GameActivity {
             addContentView(imeView, params);
         } catch (Throwable error) {
             Log.w(TAG, "Could not install the soft-keyboard host view", error);
+        }
+    }
+        /**
+     * Wake the native event loop so it reads the queued IME state on the same frame.
+     *
+     * GameActivity's onKeyDown hands a key event to the native queue (whose glue
+     * calls ALooper_wake), and winit reports KEYCODE_UNKNOWN as `Key::Unidentified`,
+     * which no widget acts on. Both press and release go, or the key would look
+     * held down.
+     *
+     * Without this, a queued IME state waits in the queue until the loop next
+     * wakes for another reason (a frame timer, a touch, egui's cursor blink) —
+     * up to half a second — which is the lag felt as "phải space mới hiện chữ
+     * có dấu": the character only appears when another event happens to wake
+     * the loop.
+     */
+    private void wakeNativeLoopForIme() {
+        try {
+            super.onKeyDown(
+                    KeyEvent.KEYCODE_UNKNOWN,
+                    new KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_UNKNOWN));
+            super.onKeyUp(
+                    KeyEvent.KEYCODE_UNKNOWN,
+                    new KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_UNKNOWN));
+        } catch (Throwable error) {
+            Log.w(TAG, "Could not wake the native loop for an IME state", error);
         }
     }
 
