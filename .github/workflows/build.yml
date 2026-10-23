@@ -1,15 +1,12 @@
-name: Build ArtCraft APKs
+name: Build ArtCraft APK (manual)
 
+# CHỈ chạy khi bấm "Run workflow" — không auto-build khi push/PR
 on:
-  push:
-    branches: [ main, master ]
-  pull_request:
-    branches: [ main, master ]
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version cần build (tag, branch, hoặc commit SHA — để trống = branch hiện tại)'
-        required: false
+        description: 'Version/tag/commit/branch cần build (BẮT BUỘC — ví dụ: v0.12.0, a1b2c3d, main)'
+        required: true
         default: ''
         type: string
       app:
@@ -18,7 +15,6 @@ on:
         default: 'photocraft'
         type: choice
         options:
-          - all
           - photocraft
           - vectorcraft
           - filmcraft
@@ -32,6 +28,7 @@ on:
           - deckcraft
           - cadcraft
           - gridcraft
+          - all
       build_type:
         description: 'Loại build'
         required: true
@@ -53,68 +50,105 @@ on:
         type: string
 
 jobs:
-  # Job 0: Liệt kê các version có sẵn để tham khảo (chạy trước, in ra log)
-  list-versions:
+  # Job 1: In danh sách tag/branch/commit để tham khảo trước khi build
+  show-versions:
     runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch' && inputs.version == ''
     steps:
-      - name: Checkout repository
+      - name: Checkout (full history + tags)
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           fetch-tags: true
 
-      - name: List available versions (tags + recent branches)
+      - name: Show available versions
         run: |
-          echo "=== Available tags (versions) ==="
-          git tag --sort=-v:refname | head -30 || echo "(no tags)"
+          echo "=========================================="
+          echo "  VERSION ĐANG CHỌN: ${{ inputs.version }}"
+          echo "=========================================="
           echo ""
-          echo "=== Recent branches ==="
+          echo "=== TAGS (version) có sẵn ==="
+          git tag --sort=-v:refname | head -50 || echo "(chưa có tag nào)"
+          echo ""
+          echo "=== BRANCHES gần đây ==="
           git branch -r --sort=-committerdate | head -20
           echo ""
-          echo "=== Latest 10 commits ==="
+          echo "=== 10 COMMIT gần nhất ==="
           git log --oneline -10
+          echo ""
+          echo "=========================================="
 
-  # Job 1: Build
+  # Job 2: Kiểm tra version có tồn tại không (fail sớm nếu sai)
+  validate-version:
+    runs-on: ubuntu-latest
+    outputs:
+      resolved_sha: ${{ steps.resolve.outputs.sha }}
+    steps:
+      - name: Checkout (full history + tags)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Resolve version -> commit SHA
+        id: resolve
+        run: |
+          REF="${{ inputs.version }}"
+          echo "Đang kiểm tra: $REF"
+          if ! SHA=$(git rev-parse --verify "$REF^{commit}" 2>/dev/null); then
+            echo "::error::Không tìm thấy version '$REF'."
+            echo ""
+            echo "=== Tags có sẵn ==="
+            git tag --sort=-v:refname | head -30
+            echo ""
+            echo "=== Branches có sẵn ==="
+            git branch -r | head -20
+            echo ""
+            echo "=== Commits gần nhất ==="
+            git log --oneline -10
+            exit 1
+          fi
+          echo "OK: $REF -> $SHA"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          git log -1 --pretty=format:'Commit: %H%nAuthor: %an%nDate:   %ad%nSubject: %s' "$SHA"
+          echo ""
+
+  # Job 3: Build
   build:
+    needs: validate-version
     runs-on: ubuntu-latest
     timeout-minutes: 180
     strategy:
       fail-fast: false
       max-parallel: 3
       matrix:
-        app: ${{ github.event_name == 'workflow_dispatch' && inputs.app != 'all' && fromJSON(format('["{0}"]', inputs.app)) || fromJSON('["photocraft","vectorcraft","filmcraft","lightcraft","pdfcraft","effectcraft","designcraft","figcraft","wordcraft","soundcraft","deckcraft","cadcraft","gridcraft"]') }}
+        app: ${{ inputs.app != 'all' && fromJSON(format('["{0}"]', inputs.app)) || fromJSON('["photocraft","vectorcraft","filmcraft","lightcraft","pdfcraft","effectcraft","designcraft","figcraft","wordcraft","soundcraft","deckcraft","cadcraft","gridcraft"]') }}
 
     steps:
-      # 1. Checkout đúng version
-      - name: Checkout repository
+      - name: Checkout đúng version
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.version != '' && inputs.version || github.ref }}
+          ref: ${{ needs.validate-version.outputs.resolved_sha }}
           submodules: recursive
           fetch-depth: 0
           fetch-tags: true
 
-      - name: Show checked-out version
+      - name: Show version info
         run: |
-          echo "Building from ref: ${{ github.event_name == 'workflow_dispatch' && inputs.version != '' && inputs.version || github.ref }}"
-          git log -1 --pretty=format:'%H %s' || true
-          echo ""
-          git describe --tags --always 2>/dev/null || echo "(no tag)"
+          echo "Building app: ${{ matrix.app }}"
+          echo "From version: ${{ inputs.version }}"
+          echo "Commit: ${{ needs.validate-version.outputs.resolved_sha }}"
+          git log -1 --oneline
 
-      # 2. JDK
       - name: Set up JDK 21
         uses: actions/setup-java@v4
         with:
           java-version: '21'
           distribution: 'temurin'
 
-      # 3. Android SDK
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
-      # 4. Cache Rust
-      - name: Cache Rust registry
+      - name: Cache Rust
         uses: actions/cache@v4
         with:
           path: |
@@ -124,7 +158,6 @@ jobs:
           key: rust-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: rust-${{ runner.os }}-
 
-      # 5. Cache Android SDK/NDK
       - name: Cache Android SDK/NDK
         uses: actions/cache@v4
         with:
@@ -135,8 +168,7 @@ jobs:
           key: android-${{ runner.os }}-${{ hashFiles('lib/*.py') }}
           restore-keys: android-${{ runner.os }}-
 
-      # 6. Rust + targets
-      - name: Install Rust and Android targets
+      - name: Install Rust + targets
         run: |
           if ! command -v rustc >/dev/null 2>&1; then
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
@@ -145,7 +177,6 @@ jobs:
           rustup target add aarch64-linux-android armv7-linux-androideabi
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
-      # 7. cargo-ndk
       - name: Install cargo-ndk
         run: |
           source "$HOME/.cargo/env"
@@ -153,7 +184,6 @@ jobs:
             cargo install cargo-ndk --locked
           fi
 
-      # 8. Dependencies hệ thống
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -161,26 +191,25 @@ jobs:
             python3 python3-pip pkg-config libssl-dev \
             libxcb1-dev libxkbcommon-dev zip unzip
 
-      # 9. Build release
+      # --- Build release ---
       - name: Build ${{ matrix.app }} (release)
-        if: ${{ github.event_name != 'workflow_dispatch' || inputs.build_type == 'release' || inputs.build_type == 'both' }}
+        if: ${{ inputs.build_type == 'release' || inputs.build_type == 'both' }}
         run: |
           EXTRA=""
           [ -n "${{ inputs.appname }}" ] && EXTRA="$EXTRA -appname=${{ inputs.appname }}"
           [ -n "${{ inputs.packagename }}" ] && EXTRA="$EXTRA -packagename=${{ inputs.packagename }}"
           bash build.sh -${{ matrix.app }} $EXTRA 2>&1 | tee -a "logs/build-${{ matrix.app }}-release.log"
 
-      # 10. Build debug
+      # --- Build debug ---
       - name: Build ${{ matrix.app }} (debug)
-        if: ${{ github.event_name == 'workflow_dispatch' && (inputs.build_type == 'debug' || inputs.build_type == 'both') }}
+        if: ${{ inputs.build_type == 'debug' || inputs.build_type == 'both' }}
         run: |
           EXTRA=""
           [ -n "${{ inputs.appname }}" ] && EXTRA="$EXTRA -appname=${{ inputs.appname }}"
           [ -n "${{ inputs.packagename }}" ] && EXTRA="$EXTRA -packagename=${{ inputs.packagename }}"
           bash build-debug.sh -${{ matrix.app }} $EXTRA 2>&1 | tee -a "logs/build-${{ matrix.app }}-debug.log"
 
-      # 11. Upload log nếu fail
-      - name: Upload build logs (on failure)
+      - name: Upload logs (nếu fail)
         if: failure()
         uses: actions/upload-artifact@v4
         with:
@@ -188,17 +217,16 @@ jobs:
           path: logs/
           if-no-files-found: ignore
 
-      # 12. Upload APK
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: apk-${{ matrix.app }}-${{ github.run_id }}
+          name: apk-${{ matrix.app }}-${{ inputs.version }}-${{ github.run_id }}
           path: output/*.apk
           if-no-files-found: warn
 
-  # Job 2: Gom APK
+  # Job 4: Gom tất cả APK
   collect:
-    needs: build
+    needs: [validate-version, build]
     if: always() && !cancelled()
     runs-on: ubuntu-latest
     steps:
@@ -209,12 +237,14 @@ jobs:
           pattern: apk-*
           merge-multiple: true
 
-      - name: List and upload combined
-        run: find all-apks -name "*.apk" -exec ls -lh {} \;
+      - name: List APKs
+        run: |
+          echo "=== APK đã build từ version ${{ inputs.version }} ==="
+          find all-apks -name "*.apk" -exec ls -lh {} \;
 
       - name: Upload combined APKs
         uses: actions/upload-artifact@v4
         with:
-          name: all-apks-${{ github.run_id }}
+          name: ALL-APKs-${{ inputs.version }}-${{ github.run_id }}
           path: all-apks/
           if-no-files-found: warn
