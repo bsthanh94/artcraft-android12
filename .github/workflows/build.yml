@@ -7,10 +7,15 @@ on:
     branches: [ main, master ]
   workflow_dispatch:
     inputs:
+      version:
+        description: 'Version cần build (tag, branch, hoặc commit SHA — để trống = branch hiện tại)'
+        required: false
+        default: ''
+        type: string
       app:
-        description: 'App to build (photocraft, vectorcraft, filmcraft, lightcraft, pdfcraft, effectcraft, designcraft, figcraft, wordcraft, soundcraft, deckcraft, cadcraft, gridcraft, hoặc "all" để build tất cả)'
+        description: 'App cần build'
         required: true
-        default: 'all'
+        default: 'photocraft'
         type: choice
         options:
           - all
@@ -28,7 +33,7 @@ on:
           - cadcraft
           - gridcraft
       build_type:
-        description: 'Build type'
+        description: 'Loại build'
         required: true
         default: 'release'
         type: choice
@@ -37,44 +42,78 @@ on:
           - debug
           - both
       appname:
-        description: 'Override Android display name (để trống = dùng mặc định)'
+        description: 'Override Android display name (để trống = mặc định)'
         required: false
         default: ''
+        type: string
       packagename:
         description: 'Override package name (để trống = com.artcraft.<app>)'
         required: false
         default: ''
+        type: string
 
 jobs:
-  # Job 1: Build từng app một
+  # Job 0: Liệt kê các version có sẵn để tham khảo (chạy trước, in ra log)
+  list-versions:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && inputs.version == ''
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: List available versions (tags + recent branches)
+        run: |
+          echo "=== Available tags (versions) ==="
+          git tag --sort=-v:refname | head -30 || echo "(no tags)"
+          echo ""
+          echo "=== Recent branches ==="
+          git branch -r --sort=-committerdate | head -20
+          echo ""
+          echo "=== Latest 10 commits ==="
+          git log --oneline -10
+
+  # Job 1: Build
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 180  # Build Rust + NDK cho nhiều app có thể mất 1-2 giờ
-
+    timeout-minutes: 180
     strategy:
       fail-fast: false
+      max-parallel: 3
       matrix:
         app: ${{ github.event_name == 'workflow_dispatch' && inputs.app != 'all' && fromJSON(format('["{0}"]', inputs.app)) || fromJSON('["photocraft","vectorcraft","filmcraft","lightcraft","pdfcraft","effectcraft","designcraft","figcraft","wordcraft","soundcraft","deckcraft","cadcraft","gridcraft"]') }}
 
     steps:
-      # 1. Checkout code
+      # 1. Checkout đúng version
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          submodules: recursive  # Repo có vendor/ nên cần submodule
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.version != '' && inputs.version || github.ref }}
+          submodules: recursive
+          fetch-depth: 0
+          fetch-tags: true
 
-      # 2. Cài JDK 21 (repo yêu cầu JDK 17-23; 21 là LTS)
+      - name: Show checked-out version
+        run: |
+          echo "Building from ref: ${{ github.event_name == 'workflow_dispatch' && inputs.version != '' && inputs.version || github.ref }}"
+          git log -1 --pretty=format:'%H %s' || true
+          echo ""
+          git describe --tags --always 2>/dev/null || echo "(no tag)"
+
+      # 2. JDK
       - name: Set up JDK 21
         uses: actions/setup-java@v4
         with:
           java-version: '21'
           distribution: 'temurin'
 
-      # 3. Cài Android SDK (repo tự tải nếu không có, nhưng cache giúp nhanh hơn)
+      # 3. Android SDK
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
-      # 4. Cache Cargo registry + NDK + SDK để tăng tốc build
+      # 4. Cache Rust
       - name: Cache Rust registry
         uses: actions/cache@v4
         with:
@@ -85,6 +124,7 @@ jobs:
           key: rust-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: rust-${{ runner.os }}-
 
+      # 5. Cache Android SDK/NDK
       - name: Cache Android SDK/NDK
         uses: actions/cache@v4
         with:
@@ -95,7 +135,7 @@ jobs:
           key: android-${{ runner.os }}-${{ hashFiles('lib/*.py') }}
           restore-keys: android-${{ runner.os }}-
 
-      # 5. Cài Rust + targets (repo dùng cargo-ndk bên trong build.sh)
+      # 6. Rust + targets
       - name: Install Rust and Android targets
         run: |
           if ! command -v rustc >/dev/null 2>&1; then
@@ -105,7 +145,7 @@ jobs:
           rustup target add aarch64-linux-android armv7-linux-androideabi
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
-      # 6. Cài cargo-ndk (nếu chưa có)
+      # 7. cargo-ndk
       - name: Install cargo-ndk
         run: |
           source "$HOME/.cargo/env"
@@ -113,34 +153,34 @@ jobs:
             cargo install cargo-ndk --locked
           fi
 
-      # 7. Cài dependencies hệ thống cho builder Python
+      # 8. Dependencies hệ thống
       - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             python3 python3-pip pkg-config libssl-dev \
-            libxcb1-dev libxkbcommon-dev \
-            zip unzip
+            libxcb1-dev libxkbcommon-dev zip unzip
 
-      # 8. Build từng app (release + debug tùy input)
+      # 9. Build release
       - name: Build ${{ matrix.app }} (release)
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.build_type == 'release' || inputs.build_type == 'both' }}
         run: |
-          EXTRA_ARGS=""
-          if [ -n "${{ inputs.appname }}" ]; then EXTRA_ARGS="$EXTRA_ARGS -appname=${{ inputs.appname }}"; fi
-          if [ -n "${{ inputs.packagename }}" ]; then EXTRA_ARGS="$EXTRA_ARGS -packagename=${{ inputs.packagename }}"; fi
-          bash build.sh -${{ matrix.app }} $EXTRA_ARGS 2>&1 | tee -a logs/build-${{ matrix.app }}-release.log
+          EXTRA=""
+          [ -n "${{ inputs.appname }}" ] && EXTRA="$EXTRA -appname=${{ inputs.appname }}"
+          [ -n "${{ inputs.packagename }}" ] && EXTRA="$EXTRA -packagename=${{ inputs.packagename }}"
+          bash build.sh -${{ matrix.app }} $EXTRA 2>&1 | tee -a "logs/build-${{ matrix.app }}-release.log"
 
+      # 10. Build debug
       - name: Build ${{ matrix.app }} (debug)
         if: ${{ github.event_name == 'workflow_dispatch' && (inputs.build_type == 'debug' || inputs.build_type == 'both') }}
         run: |
-          EXTRA_ARGS=""
-          if [ -n "${{ inputs.appname }}" ]; then EXTRA_ARGS="$EXTRA_ARGS -appname=${{ inputs.appname }}"; fi
-          if [ -n "${{ inputs.packagename }}" ]; then EXTRA_ARGS="$EXTRA_ARGS -packagename=${{ inputs.packagename }}"; fi
-          bash build-debug.sh -${{ matrix.app }} $EXTRA_ARGS 2>&1 | tee -a logs/build-${{ matrix.app }}-debug.log
+          EXTRA=""
+          [ -n "${{ inputs.appname }}" ] && EXTRA="$EXTRA -appname=${{ inputs.appname }}"
+          [ -n "${{ inputs.packagename }}" ] && EXTRA="$EXTRA -packagename=${{ inputs.packagename }}"
+          bash build-debug.sh -${{ matrix.app }} $EXTRA 2>&1 | tee -a "logs/build-${{ matrix.app }}-debug.log"
 
-      # 9. Upload log nếu build fail (để debug)
-      - name: Upload build logs
+      # 11. Upload log nếu fail
+      - name: Upload build logs (on failure)
         if: failure()
         uses: actions/upload-artifact@v4
         with:
@@ -148,15 +188,15 @@ jobs:
           path: logs/
           if-no-files-found: ignore
 
-      # 10. Upload APK
-      - name: Upload APK artifact
+      # 12. Upload APK
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: apk-${{ matrix.app }}-${{ github.run_id }}
           path: output/*.apk
           if-no-files-found: warn
 
-  # Job 2: Tổng hợp tất cả APK vào 1 artifact duy nhất
+  # Job 2: Gom APK
   collect:
     needs: build
     if: always() && !cancelled()
@@ -169,10 +209,8 @@ jobs:
           pattern: apk-*
           merge-multiple: true
 
-      - name: List collected APKs
-        run: |
-          echo "Collected APKs:"
-          find all-apks -name "*.apk" -exec ls -lh {} \;
+      - name: List and upload combined
+        run: find all-apks -name "*.apk" -exec ls -lh {} \;
 
       - name: Upload combined APKs
         uses: actions/upload-artifact@v4
