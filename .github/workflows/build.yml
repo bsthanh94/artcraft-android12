@@ -1,6 +1,6 @@
 name: Build ArtCraft APK (manual)
 
-# CHỈ chạy khi bấm "Run workflow"
+# CHỈ chạy khi bấm "Run workflow" — không auto-build khi push/PR
 on:
   workflow_dispatch:
     inputs:
@@ -55,7 +55,7 @@ jobs:
         app: ${{ inputs.app != 'all' && fromJSON(format('["{0}"]', inputs.app)) || fromJSON('["photocraft","vectorcraft","filmcraft","lightcraft","pdfcraft","effectcraft","designcraft","figcraft","wordcraft","soundcraft","deckcraft","cadcraft","gridcraft"]') }}
 
     steps:
-      # Checkout branch hiện tại (main) — không cần version
+      # 1. Checkout branch hiện tại (main)
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
@@ -71,15 +71,20 @@ jobs:
           echo "Commit:     ${{ github.sha }}"
           git log -1 --oneline
 
+      # 2. JDK 21
       - name: Set up JDK 21
         uses: actions/setup-java@v4
         with:
           java-version: '21'
           distribution: 'temurin'
 
+      # 3. Android SDK — chỉ cài platform-tools, KHÔNG cài "tools" (đã bị Google xóa)
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools'
 
+      # 4. Cache Rust registry + toolchain
       - name: Cache Rust
         uses: actions/cache@v4
         with:
@@ -90,6 +95,7 @@ jobs:
           key: rust-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: rust-${{ runner.os }}-
 
+      # 5. Cache Android SDK/NDK
       - name: Cache Android SDK/NDK
         uses: actions/cache@v4
         with:
@@ -100,6 +106,7 @@ jobs:
           key: android-${{ runner.os }}-${{ hashFiles('lib/*.py') }}
           restore-keys: android-${{ runner.os }}-
 
+      # 6. Cài Rust + targets Android
       - name: Install Rust + targets
         run: |
           if ! command -v rustc >/dev/null 2>&1; then
@@ -109,6 +116,7 @@ jobs:
           rustup target add aarch64-linux-android armv7-linux-androideabi
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
+      # 7. Cài cargo-ndk
       - name: Install cargo-ndk
         run: |
           source "$HOME/.cargo/env"
@@ -116,6 +124,7 @@ jobs:
             cargo install cargo-ndk --locked
           fi
 
+      # 8. Dependencies hệ thống cho builder Python
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -123,7 +132,7 @@ jobs:
             python3 python3-pip pkg-config libssl-dev \
             libxcb1-dev libxkbcommon-dev zip unzip
 
-      # --- Release ---
+      # 9. Build release
       - name: Build ${{ matrix.app }} (release)
         if: ${{ inputs.build_type == 'release' || inputs.build_type == 'both' }}
         run: |
@@ -132,7 +141,7 @@ jobs:
           [ -n "${{ inputs.packagename }}" ] && EXTRA="$EXTRA -packagename=${{ inputs.packagename }}"
           bash build.sh -${{ matrix.app }} $EXTRA 2>&1 | tee -a "logs/build-${{ matrix.app }}-release.log"
 
-      # --- Debug ---
+      # 10. Build debug
       - name: Build ${{ matrix.app }} (debug)
         if: ${{ inputs.build_type == 'debug' || inputs.build_type == 'both' }}
         run: |
@@ -141,6 +150,7 @@ jobs:
           [ -n "${{ inputs.packagename }}" ] && EXTRA="$EXTRA -packagename=${{ inputs.packagename }}"
           bash build-debug.sh -${{ matrix.app }} $EXTRA 2>&1 | tee -a "logs/build-${{ matrix.app }}-debug.log"
 
+      # 11. Upload log nếu build fail (để debug)
       - name: Upload logs (nếu fail)
         if: failure()
         uses: actions/upload-artifact@v4
@@ -149,6 +159,7 @@ jobs:
           path: logs/
           if-no-files-found: ignore
 
+      # 12. Upload APK của từng app
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
@@ -156,6 +167,7 @@ jobs:
           path: output/*.apk
           if-no-files-found: warn
 
+  # Job 2: Gom tất cả APK vào 1 artifact duy nhất
   collect:
     needs: build
     if: always() && !cancelled()
@@ -169,7 +181,9 @@ jobs:
           merge-multiple: true
 
       - name: List APKs
-        run: find all-apks -name "*.apk" -exec ls -lh {} \;
+        run: |
+          echo "=== APK đã build ==="
+          find all-apks -name "*.apk" -exec ls -lh {} \; || echo "(không có APK nào)"
 
       - name: Upload combined
         uses: actions/upload-artifact@v4
