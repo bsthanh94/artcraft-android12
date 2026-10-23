@@ -1,14 +1,9 @@
 name: Build ArtCraft APK (manual)
 
-# CHỈ chạy khi bấm "Run workflow" — không auto-build khi push/PR
+# CHỈ chạy khi bấm "Run workflow"
 on:
   workflow_dispatch:
     inputs:
-      version:
-        description: 'Version/tag/commit/branch cần build (BẮT BUỘC — ví dụ: v0.12.0, a1b2c3d, main)'
-        required: true
-        default: ''
-        type: string
       app:
         description: 'App cần build'
         required: true
@@ -50,71 +45,7 @@ on:
         type: string
 
 jobs:
-  # Job 1: In danh sách tag/branch/commit để tham khảo trước khi build
-  show-versions:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout (full history + tags)
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          fetch-tags: true
-
-      - name: Show available versions
-        run: |
-          echo "=========================================="
-          echo "  VERSION ĐANG CHỌN: ${{ inputs.version }}"
-          echo "=========================================="
-          echo ""
-          echo "=== TAGS (version) có sẵn ==="
-          git tag --sort=-v:refname | head -50 || echo "(chưa có tag nào)"
-          echo ""
-          echo "=== BRANCHES gần đây ==="
-          git branch -r --sort=-committerdate | head -20
-          echo ""
-          echo "=== 10 COMMIT gần nhất ==="
-          git log --oneline -10
-          echo ""
-          echo "=========================================="
-
-  # Job 2: Kiểm tra version có tồn tại không (fail sớm nếu sai)
-  validate-version:
-    runs-on: ubuntu-latest
-    outputs:
-      resolved_sha: ${{ steps.resolve.outputs.sha }}
-    steps:
-      - name: Checkout (full history + tags)
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          fetch-tags: true
-
-      - name: Resolve version -> commit SHA
-        id: resolve
-        run: |
-          REF="${{ inputs.version }}"
-          echo "Đang kiểm tra: $REF"
-          if ! SHA=$(git rev-parse --verify "$REF^{commit}" 2>/dev/null); then
-            echo "::error::Không tìm thấy version '$REF'."
-            echo ""
-            echo "=== Tags có sẵn ==="
-            git tag --sort=-v:refname | head -30
-            echo ""
-            echo "=== Branches có sẵn ==="
-            git branch -r | head -20
-            echo ""
-            echo "=== Commits gần nhất ==="
-            git log --oneline -10
-            exit 1
-          fi
-          echo "OK: $REF -> $SHA"
-          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
-          git log -1 --pretty=format:'Commit: %H%nAuthor: %an%nDate:   %ad%nSubject: %s' "$SHA"
-          echo ""
-
-  # Job 3: Build
   build:
-    needs: validate-version
     runs-on: ubuntu-latest
     timeout-minutes: 180
     strategy:
@@ -124,19 +55,20 @@ jobs:
         app: ${{ inputs.app != 'all' && fromJSON(format('["{0}"]', inputs.app)) || fromJSON('["photocraft","vectorcraft","filmcraft","lightcraft","pdfcraft","effectcraft","designcraft","figcraft","wordcraft","soundcraft","deckcraft","cadcraft","gridcraft"]') }}
 
     steps:
-      - name: Checkout đúng version
+      # Checkout branch hiện tại (main) — không cần version
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ needs.validate-version.outputs.resolved_sha }}
           submodules: recursive
           fetch-depth: 0
           fetch-tags: true
 
-      - name: Show version info
+      - name: Show build info
         run: |
-          echo "Building app: ${{ matrix.app }}"
-          echo "From version: ${{ inputs.version }}"
-          echo "Commit: ${{ needs.validate-version.outputs.resolved_sha }}"
+          echo "App:        ${{ matrix.app }}"
+          echo "Build type: ${{ inputs.build_type }}"
+          echo "Branch:     ${{ github.ref_name }}"
+          echo "Commit:     ${{ github.sha }}"
           git log -1 --oneline
 
       - name: Set up JDK 21
@@ -191,7 +123,7 @@ jobs:
             python3 python3-pip pkg-config libssl-dev \
             libxcb1-dev libxkbcommon-dev zip unzip
 
-      # --- Build release ---
+      # --- Release ---
       - name: Build ${{ matrix.app }} (release)
         if: ${{ inputs.build_type == 'release' || inputs.build_type == 'both' }}
         run: |
@@ -200,7 +132,7 @@ jobs:
           [ -n "${{ inputs.packagename }}" ] && EXTRA="$EXTRA -packagename=${{ inputs.packagename }}"
           bash build.sh -${{ matrix.app }} $EXTRA 2>&1 | tee -a "logs/build-${{ matrix.app }}-release.log"
 
-      # --- Build debug ---
+      # --- Debug ---
       - name: Build ${{ matrix.app }} (debug)
         if: ${{ inputs.build_type == 'debug' || inputs.build_type == 'both' }}
         run: |
@@ -220,17 +152,16 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: apk-${{ matrix.app }}-${{ inputs.version }}-${{ github.run_id }}
+          name: apk-${{ matrix.app }}-${{ github.run_id }}
           path: output/*.apk
           if-no-files-found: warn
 
-  # Job 4: Gom tất cả APK
   collect:
-    needs: [validate-version, build]
+    needs: build
     if: always() && !cancelled()
     runs-on: ubuntu-latest
     steps:
-      - name: Download all APK artifacts
+      - name: Download all APKs
         uses: actions/download-artifact@v4
         with:
           path: all-apks
@@ -238,13 +169,11 @@ jobs:
           merge-multiple: true
 
       - name: List APKs
-        run: |
-          echo "=== APK đã build từ version ${{ inputs.version }} ==="
-          find all-apks -name "*.apk" -exec ls -lh {} \;
+        run: find all-apks -name "*.apk" -exec ls -lh {} \;
 
-      - name: Upload combined APKs
+      - name: Upload combined
         uses: actions/upload-artifact@v4
         with:
-          name: ALL-APKs-${{ inputs.version }}-${{ github.run_id }}
+          name: ALL-APKs-${{ github.run_id }}
           path: all-apks/
           if-no-files-found: warn
