@@ -55,7 +55,7 @@ jobs:
         app: ${{ inputs.app != 'all' && fromJSON(format('["{0}"]', inputs.app)) || fromJSON('["photocraft","vectorcraft","filmcraft","lightcraft","pdfcraft","effectcraft","designcraft","figcraft","wordcraft","soundcraft","deckcraft","cadcraft","gridcraft"]') }}
 
     steps:
-      # 1. Checkout branch hiện tại (main)
+      # 1. Checkout
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
@@ -78,13 +78,13 @@ jobs:
           java-version: '21'
           distribution: 'temurin'
 
-      # 3. Android SDK — chỉ cài platform-tools, KHÔNG cài "tools" (đã bị Google xóa)
+      # 3. Android SDK — KHÔNG cài "tools" (đã bị Google xóa)
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
         with:
           packages: 'platform-tools'
 
-      # 4. Cache Rust registry + toolchain
+      # 4. Cache Rust
       - name: Cache Rust
         uses: actions/cache@v4
         with:
@@ -106,7 +106,7 @@ jobs:
           key: android-${{ runner.os }}-${{ hashFiles('lib/*.py') }}
           restore-keys: android-${{ runner.os }}-
 
-      # 6. Cài Rust + targets Android
+      # 6. Rust + targets
       - name: Install Rust + targets
         run: |
           if ! command -v rustc >/dev/null 2>&1; then
@@ -116,7 +116,7 @@ jobs:
           rustup target add aarch64-linux-android armv7-linux-androideabi
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
-      # 7. Cài cargo-ndk
+      # 7. cargo-ndk
       - name: Install cargo-ndk
         run: |
           source "$HOME/.cargo/env"
@@ -124,18 +124,36 @@ jobs:
             cargo install cargo-ndk --locked
           fi
 
-      # 8. Dependencies hệ thống cho builder Python
-      - name: Install system dependencies
+      # 8. Dependencies hệ thống + Pillow (cho adaptive launcher icons)
+      - name: Install system dependencies + Pillow
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            python3 python3-pip pkg-config libssl-dev \
-            libxcb1-dev libxkbcommon-dev zip unzip
+            python3 python3-pip python3-dev pkg-config libssl-dev \
+            libxcb1-dev libxkbcommon-dev zip unzip \
+            libjpeg-dev zlib1g-dev libfreetype6-dev
+
+          # Cài Pillow — thử nhiều cách để tương thích Ubuntu 22.04/24.04
+          if ! python3 -c "import PIL" 2>/dev/null; then
+            echo "Cài Pillow..."
+            python3 -m pip install --quiet --break-system-packages pillow 2>/dev/null || \
+              python3 -m pip install --quiet --user --break-system-packages pillow 2>/dev/null || \
+              python3 -m pip install --quiet --user pillow 2>/dev/null || \
+              sudo pip3 install --quiet --break-system-packages pillow 2>/dev/null || \
+              sudo pip3 install --quiet pillow
+          fi
+
+          # Verify
+          python3 -c "import PIL; print('Pillow OK:', PIL.__version__)"
+          python3 -c "import tomllib; print('tomllib OK')" 2>/dev/null || \
+            echo "CẢNH BÁO: tomllib không có — cần Python 3.11+"
 
       # 9. Build release
       - name: Build ${{ matrix.app }} (release)
         if: ${{ inputs.build_type == 'release' || inputs.build_type == 'both' }}
         run: |
+          set -o pipefail
+          mkdir -p logs
           EXTRA=""
           [ -n "${{ inputs.appname }}" ] && EXTRA="$EXTRA -appname=${{ inputs.appname }}"
           [ -n "${{ inputs.packagename }}" ] && EXTRA="$EXTRA -packagename=${{ inputs.packagename }}"
@@ -145,12 +163,14 @@ jobs:
       - name: Build ${{ matrix.app }} (debug)
         if: ${{ inputs.build_type == 'debug' || inputs.build_type == 'both' }}
         run: |
+          set -o pipefail
+          mkdir -p logs
           EXTRA=""
           [ -n "${{ inputs.appname }}" ] && EXTRA="$EXTRA -appname=${{ inputs.appname }}"
           [ -n "${{ inputs.packagename }}" ] && EXTRA="$EXTRA -packagename=${{ inputs.packagename }}"
           bash build-debug.sh -${{ matrix.app }} $EXTRA 2>&1 | tee -a "logs/build-${{ matrix.app }}-debug.log"
 
-      # 11. Upload log nếu build fail (để debug)
+      # 11. Upload log nếu fail
       - name: Upload logs (nếu fail)
         if: failure()
         uses: actions/upload-artifact@v4
@@ -159,7 +179,7 @@ jobs:
           path: logs/
           if-no-files-found: ignore
 
-      # 12. Upload APK của từng app
+      # 12. Upload APK
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
@@ -167,7 +187,7 @@ jobs:
           path: output/*.apk
           if-no-files-found: warn
 
-  # Job 2: Gom tất cả APK vào 1 artifact duy nhất
+  # Job 2: Gom tất cả APK
   collect:
     needs: build
     if: always() && !cancelled()
