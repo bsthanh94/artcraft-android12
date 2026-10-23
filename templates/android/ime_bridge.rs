@@ -1,14 +1,14 @@
 // Builder-generated Android soft-keyboard (IME) bridge (shared module).
 //
-// A bare NativeActivity has no editable view, so Android's InputMethodManager cannot reliably show
+// A bare GameActivity has no editable view, so Android's InputMethodManager cannot reliably show
 // the soft keyboard and never delivers typed text. The generated Activity (see
 // templates/android/SafActivity.java) installs a tiny, invisible but focusable `EditText` whose real
-// InputConnection fixes both: the shell calls `imeShow`/`imeHide` through the vendored
-// `android-activity`, and this module drains the queued commit/composition/delete events once per
-// frame into the egui events the focused `TextEdit` understands. The upstream ArtCraft crates are
-// never modified.
+// InputConnection pushes the *whole* text state (`selection_start|selection_end|text`) into a queue
+// on every edit. This module drains that queue once per frame, diffs the new state against the last
+// one, and emits Backspace/Delete key events plus a Commit — never `DeleteSurrounding`, which egui
+// TextEdit may reorder after the Commit and so delete the wrong character.
 //
-// ARTCRAFT_ANDROID_IME_BRIDGE_V1
+// ARTCRAFT_ANDROID_IME_BRIDGE_V5_DIFF
 pub mod ime {
     use android_activity::AndroidApp;
     use jni::{
@@ -19,7 +19,7 @@ pub mod ime {
 
     /// Emitted at startup so a device log (and the packaged `.so` strings) can confirm this shell —
     /// including the soft-keyboard bridge — is the one running.
-    pub const IME_MARKER: &str = "ARTCRAFT_ANDROID_IME_BRIDGE_V1";
+    pub const IME_MARKER: &str = "ARTCRAFT_ANDROID_IME_BRIDGE_V5_DIFF";
 
     pub struct ImeBridge {
         app: AndroidApp,
@@ -27,6 +27,10 @@ pub mod ime {
         /// Set once the Activity reports it has no `imePoll` (an Activity that never adopted the IME
         /// host view), so the per-frame poll stops paying for a call that can only fail.
         unsupported: bool,
+        /// Toàn bộ text IME đang giữ (đồng bộ với EditText bên Java).
+        ime_text: String,
+        /// Selection hiện tại, tính bằng UTF-16 offset (Android native).
+        ime_selection: (usize, usize),
     }
 
     impl ImeBridge {
@@ -37,6 +41,8 @@ pub mod ime {
                 app: app.clone(),
                 vm: Arc::new(vm),
                 unsupported: false,
+                ime_text: String::new(),
+                ime_selection: (0, 0),
             }
         }
 
@@ -47,12 +53,8 @@ pub mod ime {
                 return;
             }
             loop {
-                match self.next_event() {
-                    Ok(Some(event)) => {
-                        if let Some(event) = translate(&event) {
-                            raw.events.push(event);
-                        }
-                    }
+                match self.next_state() {
+                    Ok(Some(state)) => self.handle_text_state(&state, raw),
                     Ok(None) => break,
                     Err(error) => {
                         log::warn!("Android soft-keyboard bridge unavailable: {error}");
@@ -86,7 +88,7 @@ pub mod ime {
                 .map_err(|error| error.to_string())
         }
 
-        fn next_event(&self) -> Result<Option<String>, String> {
+        fn next_state(&self) -> Result<Option<String>, String> {
             self.vm
                 .attach_current_thread(|env| -> jni::errors::Result<Option<String>> {
                     let activity_raw = self.app.activity_as_ptr() as jni::sys::jobject;
@@ -119,63 +121,140 @@ pub mod ime {
                 })
                 .map_err(|error| error.to_string())
         }
-    }
 
-    /// A synthetic Enter press. Both the IME's action key (`a`) and its Enter/newline key (`c` with a
-    /// bare newline) become this, so egui decides what Enter means for the focused field.
-    fn enter_key() -> egui::Event {
-        egui::Event::Key {
-            key: egui::Key::Enter,
-            physical_key: None,
-            pressed: true,
-            repeat: false,
-            modifiers: egui::Modifiers::default(),
+        /// Diff new text state vs last state, push egui events.
+        ///
+        /// - **Cursor đúng**: chỉ Commit thêm text (không có preedit) → cursor luôn ở cuối.
+        /// - **Realtime**: mỗi phím của LabanKey gửi state mới → commit ngay → chữ hiện tức thì.
+        /// - **Không double text**: Backspace/Delete key events thay `DeleteSurrounding` →
+        ///   xử lý tuần tự trong TextEdit, không bị reorder sau Commit.
+        /// - **Không chữ "to"**: không dùng Preedit → mọi ký tự hiển thị với font chính,
+        ///   kể cả U+1EC5 (ễ), U+1EEF (ữ).
+        fn handle_text_state(&mut self, state_str: &str, raw: &mut egui::RawInput) {
+            let mut parts = state_str.splitn(3, '|');
+            let start: usize = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            let end: usize = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            let text = parts.next().unwrap_or("").to_owned();
+
+            let old = std::mem::replace(&mut self.ime_text, text.clone());
+            let old_chars: Vec<char> = old.chars().collect();
+            let new_chars: Vec<char> = text.chars().collect();
+
+            // Common prefix.
+            let prefix = old_chars
+                .iter()
+                .zip(&new_chars)
+                .take_while(|(a, b)| a == b)
+                .count();
+
+            // Common suffix, bounded by the cursor so a trailing run of identical characters
+            // (or a character that just moved) doesn't get counted as unchanged.
+            let old_cursor = Self::utf16_char_offset(&old, self.ime_selection.1);
+            let new_cursor = Self::utf16_char_offset(&text, end);
+            let suffix_limit = old_chars
+                .len()
+                .saturating_sub(old_cursor)
+                .min(new_chars.len().saturating_sub(new_cursor));
+            let suffix = old_chars[prefix..]
+                .iter()
+                .rev()
+                .zip(new_chars[prefix..].iter().rev())
+                .take(suffix_limit)
+                .take_while(|(a, b)| a == b)
+                .count();
+
+            let removed_total = old_chars.len() - prefix - suffix;
+            let added: String = new_chars[prefix..new_chars.len() - suffix].iter().collect();
+
+            log::info!(
+                "IME diff: old={:?} new={:?} prefix={} suffix={} removed={} added={:?} cursor={}..{}",
+                old, text, prefix, suffix, removed_total, added, start, end
+            );
+
+            // Xoá removed bằng Backspace/Delete KEY EVENTS. Không dùng
+            // `ImeEvent::DeleteSurrounding` vì egui TextEdit có thể xử lý Commit trước
+            // DeleteSurrounding → xoá nhầm ký tự ("thaà" thay vì "thà", "toôi" thay vì "tôi").
+            if removed_total > 0 {
+                let removed_before = old_cursor.saturating_sub(prefix).min(removed_total);
+                let removed_after = removed_total - removed_before;
+                for _ in 0..removed_before {
+                    raw.events.push(egui::Event::Key {
+                        key: egui::Key::Backspace,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::default(),
+                    });
+                    raw.events.push(egui::Event::Key {
+                        key: egui::Key::Backspace,
+                        physical_key: None,
+                        pressed: false,
+                        repeat: false,
+                        modifiers: egui::Modifiers::default(),
+                    });
+                }
+                for _ in 0..removed_after {
+                    raw.events.push(egui::Event::Key {
+                        key: egui::Key::Delete,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::default(),
+                    });
+                    raw.events.push(egui::Event::Key {
+                        key: egui::Key::Delete,
+                        physical_key: None,
+                        pressed: false,
+                        repeat: false,
+                        modifiers: egui::Modifiers::default(),
+                    });
+                }
+            }
+
+            // Sau đó insert new text. Bỏ newline thô (Enter đi qua key event riêng).
+            let added_clean: String = added
+                .chars()
+                .filter(|c| *c != '\n' && *c != '\r')
+                .collect();
+            if !added_clean.is_empty() {
+                raw.events.push(egui::Event::Ime(egui::ImeEvent::Commit(added_clean)));
+            }
+
+            // Newlines trong added → Enter key presses.
+            let newline_count = added.chars().filter(|c| *c == '\n').count();
+            for _ in 0..newline_count.min(8) {
+                raw.events.push(egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::default(),
+                });
+                raw.events.push(egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: None,
+                    pressed: false,
+                    repeat: false,
+                    modifiers: egui::Modifiers::default(),
+                });
+            }
+
+            self.ime_selection = (start, end);
         }
-    }
 
-    /// Decode one queued event. The first character tags it and the rest is the payload:
-    /// `c` commit, `p` pre-edit, `f` finish composing, `d` delete `before,after`, `a` editor action.
-    fn translate(event: &str) -> Option<egui::Event> {
-        let mut chars = event.chars();
-        let tag = chars.next()?;
-        let payload = chars.as_str();
-        match tag {
-            'c' if !payload.is_empty() => {
-                // The Enter/newline key arrives as a bare newline. egui deliberately ignores
-                // `Commit("\n")` (newlines are handled by `Key::Enter`), so translate it: a multiline
-                // field gets a newline, a single-line field confirms and drops focus.
-                if payload == "\n" || payload == "\r" || payload == "\r\n" {
-                    return Some(enter_key());
+        /// UTF-16 offset → char offset (Android báo offset bằng UTF-16 code units).
+        fn utf16_char_offset(text: &str, offset: usize) -> usize {
+            let mut units = 0;
+            let mut chars = 0;
+            for ch in text.chars() {
+                let next = units + ch.len_utf16();
+                if next > offset {
+                    break;
                 }
-                Some(egui::Event::Ime(egui::ImeEvent::Commit(payload.to_owned())))
+                units = next;
+                chars += 1;
             }
-            'p' => Some(egui::Event::Ime(egui::ImeEvent::Preedit {
-                text: payload.to_owned(),
-                active_range_chars: None,
-            })),
-            'f' => Some(egui::Event::Ime(egui::ImeEvent::Preedit {
-                text: String::new(),
-                active_range_chars: None,
-            })),
-            'd' => {
-                let (before, after) = payload.split_once(',')?;
-                let before_chars = before.trim().parse().ok()?;
-                let after_chars = after.trim().parse().ok()?;
-                Some(egui::Event::Ime(egui::ImeEvent::DeleteSurrounding {
-                    before_chars,
-                    after_chars,
-                }))
-            }
-            'a' => {
-                let action: i32 = payload.trim().parse().ok()?;
-                // IME_ACTION_NONE (0) carries no meaning; any real action (Done/Go/Search/Send)
-                // confirms the field.
-                if action == 0 {
-                    return None;
-                }
-                Some(enter_key())
-            }
-            _ => None,
+            chars
         }
     }
 }
